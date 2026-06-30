@@ -11,8 +11,8 @@ from pathlib import Path
 import logging
 
 from app.models.schemas import ResearchState, SearchResult, ResearchPlan
-from app.tools.websearch import multi_search
-from app.tools.scraper import enrich_results
+from app.tools.web_search import multi_search
+from app.tools.scrapper import enrich_results
 
 logger = logging.getLogger(__name__)
 

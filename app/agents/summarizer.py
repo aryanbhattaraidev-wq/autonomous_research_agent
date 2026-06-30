@@ -16,7 +16,7 @@ from app.models.schemas import SearchResult, StructuredSummary, ResearchState
 
 logger = logging.getLogger(__name__)
 
-_PROMPT = (Path(__name__).parent.parent / "prompts" / "summarize.txt").read_text()
+_PROMPT = (Path(__file__).parent.parent / "prompts" / "summarize.txt").read_text()
 _MAX_CONTENT_CHARS = 6_000  # per document fed to LLM
 _MAX_DOCS_PER_CALL = 3      # batch size to avoid context overflow
 
