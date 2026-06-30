@@ -49,20 +49,13 @@ class ResearchState(BaseModel):
     """Shared state threaded throughtout the langgraph research graph."""
     topic: str = ""
     conversation_history: list[dict[str, str]] = Field(default_factory=list)
-
     plan: ResearchPlan | None = None
-
     raw_documents: list[SearchResult] = Field(default_factory=list)
-
     summaries: list[StructuredSummary] = Field(default_factory=list)
-
     notes: ResearchNote | None = None
-
     report: str = ""
-
     retrieved_context: str = ""
     follow_up_answer: str = ""
-
     error: str = ""
     status: Literal["idle", "planning", "researching", "summarizing", "nothing", "done"] = "idle"
 
