@@ -4,8 +4,9 @@ Streamlit UI for the Autonomous Research Agent.
 Communicates with the FastAPI backend at http://localhost:8000.
 """
 from __future__ import annotations
+import html
+import json
 import os
-import time
 from pathlib import Path
 
 import requests
@@ -83,11 +84,46 @@ def api_post(path: str, payload: dict) -> dict | None:
     return None
 
 
+def stream_research(topic: str, on_progress) -> dict | None:
+    """POST /research/stream and consume server-sent events. Returns the final result dict."""
+    try:
+        with requests.post(f"{API_BASE}/research/stream", json={"topic": topic}, stream=True, timeout=600) as r:
+            r.raise_for_status()
+            event, result = None, None
+            for line in r.iter_lines(decode_unicode=True):
+                if line.startswith("event:"):
+                    event = line.split(":", 1)[1].strip()
+                elif line.startswith("data:"):
+                    data = json.loads(line.split(":", 1)[1].strip())
+                    if event == "progress":
+                        on_progress(data["node"], data["label"])
+                    elif event == "result":
+                        result = data
+                    elif event == "error":
+                        st.error(f"Research failed: {data.get('detail')}")
+                        return None
+            return result
+    except requests.exceptions.ConnectionError:
+        st.error("Cannot reach the backend. Start it with: uv run uvicorn app.main:app --port 8000")
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
+    return None
+
+
 def api_get(path: str) -> dict | list | None:
     try:
         r = requests.get(f"{API_BASE}{path}", timeout=30)
         r.raise_for_status()
         return r.json()
+    except Exception:
+        return None
+
+
+def api_get_text(path: str) -> str | None:
+    try:
+        r = requests.get(f"{API_BASE}{path}", timeout=30)
+        r.raise_for_status()
+        return r.text
     except Exception:
         return None
 
@@ -120,7 +156,7 @@ with st.sidebar:
             if st.button(f"📄 {note_name}", key=f"note_{note_name}", use_container_width=True):
                 st.session_state.active_topic = note_name
                 # Load the note markdown
-                md = api_get(f"/notes/{note_name}")
+                md = api_get_text(f"/notes/{note_name}")
                 if md:
                     st.session_state.research_result = {"_loaded_note": md, "topic": note_name}
     else:
@@ -133,13 +169,13 @@ with st.sidebar:
     mem_topics = api_get("/memory/topics") or []
     if mem_topics:
         for t in mem_topics:
-            st.markdown(f'<div class="ra-tag">{t}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="ra-tag">{html.escape(t)}</div>', unsafe_allow_html=True)
     else:
         st.caption("Vector DB is empty.")
 
     st.markdown("---")
     st.markdown(
-        "<small>Built with LangGraph · FastAPI · Qdrant · Streamlit</small>",
+        "<small>Built with LangGraph · OpenRouter · FastAPI · Qdrant · Streamlit</small>",
         unsafe_allow_html=True,
     )
 
@@ -170,26 +206,17 @@ with tab_research:
         st.session_state.active_topic = topic
         st.session_state.chat_history = []
 
-        progress_bar = st.progress(0, text="Initialising …")
-        status_box = st.empty()
+        order = ["planner", "researcher", "summarizer", "notes", "memory"]
+        progress_bar = st.progress(0, text="Starting ...")
 
-        steps = [
-            (15, "🗺️  Planning research …"),
-            (35, "🌐  Searching the web …"),
-            (60, "📖  Summarising findings …"),
-            (80, "📝  Writing notes …"),
-            (95, "🧠  Storing to memory …"),
-        ]
-        for pct, msg in steps:
-            progress_bar.progress(pct, text=msg)
-            status_box.info(msg)
-            time.sleep(0.3)
+        def on_progress(node: str, label: str) -> None:
+            done = order.index(node) + 1 if node in order else 0
+            nxt = order[done] if done < len(order) else None
+            text = f"Done: {label}" + (f"  |  next: {nxt}" if nxt else "")
+            progress_bar.progress(int(done / len(order) * 100), text=text)
 
-        with st.spinner("Running full research pipeline …"):
-            result = api_post("/research", {"topic": topic})
-
-        progress_bar.progress(100, text="✅ Complete!")
-        status_box.empty()
+        result = stream_research(topic, on_progress)
+        progress_bar.progress(100, text="Complete" if result else "Failed")
 
         if result:
             st.session_state.research_result = result
@@ -229,7 +256,7 @@ with tab_notes:
         concepts = res.get("key_concepts", [])
         if concepts:
             st.markdown("### 🔑 Key Concepts")
-            tags_html = "".join(f'<span class="ra-tag">{c}</span>' for c in concepts)
+            tags_html = "".join(f'<span class="ra-tag">{html.escape(c)}</span>' for c in concepts)
             st.markdown(tags_html, unsafe_allow_html=True)
             st.markdown("")
 
@@ -247,7 +274,7 @@ with tab_notes:
                     q = fc.get("question", "")
                     a = fc.get("answer", "")
                     with st.container():
-                        st.markdown(f'<div class="ra-card"><b>Q{i}:</b> {q}</div>', unsafe_allow_html=True)
+                        st.markdown(f'<div class="ra-card"><b>Q{i}:</b> {html.escape(q)}</div>', unsafe_allow_html=True)
                         with st.expander("Show answer"):
                             st.write(a)
 
@@ -271,7 +298,7 @@ with tab_notes:
         if sources:
             with st.expander(f"🔗 Sources ({len(sources)})"):
                 for src in sources:
-                    st.markdown(f'<div class="ra-source">🔗 <a href="{src}" target="_blank">{src}</a></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="ra-source">🔗 <a href="{html.escape(src)}" target="_blank">{html.escape(src)}</a></div>', unsafe_allow_html=True)
 
         # Download note
         notes_md = res.get("notes_markdown", report)
@@ -300,7 +327,7 @@ with tab_chat:
                 if msg.get("sources"):
                     with st.expander("Sources used"):
                         for src in msg["sources"]:
-                            st.markdown(f'<span class="ra-source">{src}</span>', unsafe_allow_html=True)
+                            st.markdown(f'<span class="ra-source">{html.escape(src)}</span>', unsafe_allow_html=True)
 
         # Chat input
         user_q = st.chat_input("Ask a follow-up question …")
@@ -326,7 +353,7 @@ with tab_chat:
                     if sources:
                         with st.expander("Sources used"):
                             for src in sources:
-                                st.markdown(f'<span class="ra-source">{src}</span>', unsafe_allow_html=True)
+                                st.markdown(f'<span class="ra-source">{html.escape(src)}</span>', unsafe_allow_html=True)
                     st.session_state.chat_history.append({
                         "role": "assistant",
                         "content": answer,
