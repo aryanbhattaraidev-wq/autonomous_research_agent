@@ -1,32 +1,32 @@
 """
 app/agents/notes_agent.py
-Notes agent - converts summaries into polished markdown notes + flashcards
+Notes agent - converts summaries into polished markdown notes + flashcards.
 """
-
 from __future__ import annotations
-import json
-import os
 import logging
-from dotenv import load_dotenv
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 
-from app.models.schemas import StructuredSummary, ResearchState, ResearchNote
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
+from app.graph.state import ResearchState
+from app.llm import get_llm, invoke_structured
+from app.memory.notes_store import save_note
+from app.models.schemas import ResearchNote, StructuredSummary
 
 logger = logging.getLogger(__name__)
-_PROMPT = (Path(__file__).parent.parent / "prompts" / "notes.txt").read_text()
+_PROMPT = (Path(__file__).parent.parent / "prompts" / "notes.txt").read_text(encoding="utf-8")
 
-load_dotenv()
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _build_summary(summaries: list[StructuredSummary]) -> str:
     """Flatten multiple summaries into a single text block for the LLM."""
-    parts: list[str] = []
+    parts = []
     for s in summaries:
-        part = (
+        parts.append(
             f"=== {s.topic} ===\n"
             f"Summary: {s.summary}\n"
             f"Key ideas: {'; '.join(s.key_ideas)}\n"
@@ -35,82 +35,45 @@ def _build_summary(summaries: list[StructuredSummary]) -> str:
             f"Limitations: {'; '.join(s.limitations)}\n"
             f"Sources: {'; '.join(s.sources)}"
         )
-        parts.append(part)
     return "\n\n".join(parts)
 
 
 def notes_node(state: ResearchState) -> dict:
-    """
-    Langgraph node.
-    Input: state["summaries"], state["plan"] 
-    Output: state["notes"] + state["report"] + state["status"]
-    """
+    """LangGraph node. Input: summaries, plan. Output: notes, report, status."""
+    plan = state.get("plan") or {}
+    topic = state.get("topic") or plan.get("topic", "research")
     summaries_data = state.get("summaries", [])
-    plan_data = state.get("plan", {})
-    topic = plan_data.get("topic", state.get("topic", "research"))
 
     if not summaries_data:
-        logger.warning("[Notes] No summaries — generating placeholder note")
+        logger.warning("[Notes] No summaries - generating placeholder note")
         note = ResearchNote(
             topic=topic,
-            markdown=f"# {topic}\n\nNo research data was collected. Please check your API keys.",
-            flashcards=[],
-            key_concepts=[],
-            created_at=datetime.now(timezone.utc).isoformat(),
+            markdown=f"# {topic}\n\nNo research data was collected. Check your Tavily / LLM API keys and the server logs.",
+            created_at=_now(),
         )
-        return {**state, "notes": note.model_dump(), "report": note.markdown, "status": "done"}
+        return {"notes": note.model_dump(), "report": note.markdown, "status": "storing"}
 
     summaries = [StructuredSummary(**s) for s in summaries_data]
     summary_text = _build_summary(summaries)
 
-    llm = ChatGroq(
-        model="qwen/qwen3-32b",
-        api_key=os.getenv("GROQ_API_KEY")
-    ).with_structured_output(ResearchNote)
-
-    messages = [
-       SystemMessage(content=_PROMPT), 
-       HumanMessage(content=f'Main topic: "{topic}"\n\nResearch summaries:\n{summary_text}') 
-    ]
-
     try:
-        response = llm.invoke(messages)
-        raw = response.content.strip()
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        data = json.loads(raw)
-        note = ResearchNote(
-            **data,
-            created_at=datetime.now(timezone.utc).isoformat(),
+        note = invoke_structured(
+            get_llm(),
+            [SystemMessage(content=_PROMPT),
+             HumanMessage(content=f'Main topic: "{topic}"\n\nResearch summaries:\n{summary_text}')],
+            ResearchNote,
         )
+        note.created_at = _now()
     except Exception as exc:
-        logger.error("[Notes] Error: %s", exc)
-        note = ResearchNote(
-            topic=topic,
-            markdown=f"# {topic}\n\n{summary_text}",
-            flashcards=[],
-            key_concepts=[],
-            created_at=datetime.now(timezone.utc).isoformat(),
-        )
+        logger.error("[Notes] Error: %s - using raw-summary fallback", exc)
+        note = ResearchNote(topic=topic, markdown=f"# {topic}\n\n{summary_text}", created_at=_now())
 
-    _save_note(note)
+    note.topic = topic  # keep the user's topic as the canonical key
+    save_note(topic, note.markdown)
 
-    # Build final report: note markdown + sources section
-    all_sources = list({url for s in summaries for url in s.sources})
-    sources_block = "\n".join(f"- {src}" for src in all_sources) if all_sources else "_No sources._"
+    sources = list(dict.fromkeys(url for s in summaries for url in s.sources))
+    sources_block = "\n".join(f"- {src}" for src in sources) if sources else "_No sources._"
     report = note.markdown + f"\n\n---\n\n## Sources\n{sources_block}"
 
     logger.info("[Notes] Note created for topic=%r", topic)
-    return {**state, "notes": note.model_dump(), "report": report, "status": "done"}
-
-
-def _save_note(note: ResearchNote) -> None:
-    """Save note as a markdown file in the notes directory."""
-    notes_dir = Path(os.getenv("NOTES_DIR", "./notes"))
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    filename = note.topic.lower().replace(" ", "_")[:60] + ".md"
-    filepath = notes_dir / filename
-    try:
-        filepath.write_text(note.markdown, encoding="utf-8")
-        logger.info("[Notes] Saved note to %s", filepath)
-    except Exception as exc:
-        logger.warning("[Notes] Could not save note: %s", exc)
+    return {"notes": note.model_dump(), "report": report, "status": "storing"}

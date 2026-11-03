@@ -3,34 +3,31 @@ app/tools/web_search.py
 Web search via Tavily API with graceful fallback.
 """
 from __future__ import annotations
-import os
 import logging
-from typing import Optional
 from tavily import TavilyClient
 
+from app.config import get_settings
 from app.models.schemas import SearchResult
 
 logger = logging.getLogger(__name__)
 
 
-def search_web(query: str, max_results: int | None = 3) -> list[SearchResult]:
+def search_web(query: str, max_results: int = 3) -> list[SearchResult]:
     """
     Search the web using the Tavily API.
     Returns a list of SearchResult objects.
     Falls back to an empty list if the API key is missing.
     """
-    api_key = os.getenv("TAVILY_API_KEY", "")
+    api_key = get_settings().tavily_api_key
     if not api_key:
         logger.warning("TAVILY_API_KEY not set — returning empty search results.")
         return []
-
-    max_results = max_results 
 
     try:
         client = TavilyClient(api_key=api_key)
         response = client.search(
             query=query,
-            search_depth="advanced",
+            search_depth="basic",
             max_results=max_results,
             include_raw_content=True,
         )

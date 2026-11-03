@@ -2,7 +2,7 @@
 Pydantic schemas for the research agent system.
 """
 from pydantic import BaseModel, Field
-from typing import Any, Literal
+from typing import Any
 
 # planner
 class ResearchPlan(BaseModel):
@@ -44,30 +44,13 @@ class ResearchNote(BaseModel):
     created_at: str = ""
 
 
-# graph state
-class ResearchState(BaseModel):
-    """Shared state threaded throughtout the langgraph research graph."""
-    topic: str = ""
-    conversation_history: list[dict[str, str]] = Field(default_factory=list)
-    plan: ResearchPlan | None = None
-    raw_documents: list[SearchResult] = Field(default_factory=list)
-    summaries: list[StructuredSummary] = Field(default_factory=list)
-    notes: ResearchNote | None = None
-    report: str = ""
-    retrieved_context: str = ""
-    follow_up_answer: str = ""
-    error: str = ""
-    status: Literal["idle", "planning", "researching", "summarizing", "nothing", "done"] = "idle"
-
-
-
 # API request/response 
 class ResearchRequest(BaseModel):
     topic: str = Field(..., min_length=3, max_length=500)
 
 class FollowUpRequest(BaseModel):
     topic: str
-    question: str
+    question: str = Field(..., min_length=1)
     conversation_history: list[dict[str, str]] = Field(default_factory=list)
 
 class ResearchResponse(BaseModel):

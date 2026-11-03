@@ -2,30 +2,27 @@
 app/agents/summarizer.py
 Summarizer agent - converts raw documents into structured summaries.
 """
-
 from __future__ import annotations
-import json
-import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from app.models.schemas import SearchResult, StructuredSummary, ResearchState
+from app.graph.state import ResearchState
+from app.llm import get_llm, invoke_structured
+from app.models.schemas import SearchResult, StructuredSummary
 
 logger = logging.getLogger(__name__)
 
-_PROMPT = (Path(__file__).parent.parent / "prompts" / "summarize.txt").read_text()
-_MAX_CONTENT_CHARS = 6_000  # per document fed to LLM
+_PROMPT = (Path(__file__).parent.parent / "prompts" / "summarize.txt").read_text(encoding="utf-8")
+_MAX_CONTENT_CHARS = 6_000  # per document fed to the LLM
 _MAX_DOCS_PER_CALL = 3      # batch size to avoid context overflow
+_MAX_WORKERS = 4
 
-def _summarize_batch(
-        llm: ChatGroq,
-        topic: str,
-        docs: list[SearchResult]
-) -> StructuredSummary | None:
-    """Summarize a batch of documents into one StructuredSummary"""
+
+def _summarize_batch(llm, label: str, docs: list[SearchResult]) -> StructuredSummary | None:
+    """Summarize a batch of documents into one StructuredSummary."""
     content_block = ""
     sources: list[str] = []
     for doc in docs:
@@ -35,61 +32,41 @@ def _summarize_batch(
 
     messages = [
         SystemMessage(content=_PROMPT),
-        HumanMessage(
-            content=(
-                f'Subtopic/Query: "{topic}"\n\n'
-                f"Research content:\n{content_block}"
-            )
-        )
+        HumanMessage(content=f'Subtopic/Query: "{label}"\n\nResearch content:\n{content_block}'),
     ]
-
     try:
-        response = llm.invoke(messages)
-        raw = response.content.strip()
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        data = json.loads(raw)
-        data.setdefault("sources", sources)
-        return StructuredSummary(**data)
+        summary = invoke_structured(llm, messages, StructuredSummary)
+        if not summary.sources:
+            summary.sources = sources
+        return summary
     except Exception as exc:
         logger.error("[Summarizer] batch error: %s", exc)
         return None
 
 
 def summarizer_node(state: ResearchState) -> dict:
-    """
-    Langgraph node.
-    Input: state["raw_documents"], state["plan"] 
-    Output: state["summaries"], state["status"]
-    """
+    """LangGraph node. Input: raw_documents, plan. Output: summaries, status."""
     raw_docs = state.get("raw_documents", [])
-    plan_data = state.get("plan", {})
-    topic = plan_data.get("topic", state.get("topic", "research"))
-    search_queries = plan_data.get("search_queries", [topic])
+    plan = state.get("plan") or {}
+    topic = state.get("topic") or plan.get("topic", "research")
+    queries = plan.get("search_queries") or [topic]
 
     if not raw_docs:
         logger.warning("[Summarizer] No documents to summarize.")
-        return {**state, "summaries": [], "status": "noting"}
+        return {"summaries": [], "status": "noting"}
 
     docs = [SearchResult(**d) for d in raw_docs]
+    llm = get_llm(fast=True)
 
-    llm = ChatGroq(
-        model="qwen/qwen3-32b",
-        api_key=os.getenv("GROQ_API_KEY")
-    ).with_structured_output(StructuredSummary)
+    batches = [(queries[(i // _MAX_DOCS_PER_CALL) % len(queries)] if queries else topic, docs[i : i + _MAX_DOCS_PER_CALL])
+               for i in range(0, len(docs), _MAX_DOCS_PER_CALL)]
+    # Label each batch with the topic itself so summaries stay on-topic.
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+        results = list(pool.map(lambda b: _summarize_batch(llm, f"{topic} - {b[0]}", b[1]), batches))
 
-    summaries: list[StructuredSummary] = []
-
-    for i in range(0, len(docs), _MAX_CONTENT_CHARS):
-        batch = docs[i: i + _MAX_CONTENT_CHARS]
-        query_labels = search_queries[i // _MAX_DOCS_PER_CALL] if (i // _MAX_DOCS_PER_CALL) < len(search_queries) else topic
-        summary = _summarize_batch(llm, query_labels, batch)
-        if summary:
-            summaries.append(summary)
-
-    logger.info("[Summarize] Produced %d summaries", len(summaries))
-
-    return {
-        **state, 
-        "summaries": [s.model_dump() for s in summaries], 
-        "status": "noting"
-    }
+    summaries = [s for s in results if s]
+    logger.info("[Summarizer] Produced %d summaries from %d batches", len(summaries), len(batches))
+    update: dict = {"summaries": [s.model_dump() for s in summaries], "status": "noting"}
+    if not summaries:
+        update["error"] = "summarizer: no summaries produced"
+    return update
